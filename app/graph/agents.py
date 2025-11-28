@@ -8,13 +8,13 @@ from app.vectorstore.chroma_client import get_chroma
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 
 from .state import AgentState
-
 import re 
 
 from app.middleware.context_limit import ContextLimitMiddleware
 from app.middleware.latency import LatencyMiddleware
 from app.middleware.prompt_firewall import PromptFirewall
 from app.middleware.step_counter import StepCounterMiddleware
+from app.retrieval.bm25_store import bm25
 
 llm = get_llm()
 db = get_chroma()
@@ -56,19 +56,23 @@ Refined Question:
 @latency
 def node_retrieve(state: AgentState) -> AgentState:
     query = state.get("refined_question", state["question"])
-    results = db.similarity_search(query, k=15)
+    vector_results = db.similarity_search(query, k=12)
+    bm25_results = bm25.search(query, k=12)
 
-    if not results:
+
+    combined = {id(doc): doc for doc in (vector_results + bm25_results)}
+    merged_docs = list(combined.values())
+
+    if not merged_docs:
         return {
-            "question": state["question"],
-            "refined_question": query,
+            **state,
             "documents": [],
             "answer": "No documents found."
         }
 
-    pairs = [(query, d.page_content) for d in results]
+    pairs = [(query, d.page_content) for d in merged_docs]
     scores = reranker.score(pairs)
-    ranked = sorted(zip(results, scores), key=lambda x: x[1], reverse=True)
+    ranked = sorted(zip(merged_docs, scores), key=lambda x: x[1], reverse=True)
     top_docs: List[Document] = [d for d, s in ranked[:5]]
 
     return {
