@@ -2,6 +2,7 @@ from typing import List
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
+from copy import deepcopy
 
 from app.models.llm import get_llm
 from app.vectorstore.chroma_client import get_chroma
@@ -45,6 +46,7 @@ Refined Question:
 
     chain = prompt | llm | StrOutputParser()
     refined = chain.invoke({"question": state["question"]})
+    print("refined question:", refined.strip())
 
     return {
         "question": state["question"],
@@ -54,33 +56,58 @@ Refined Question:
     }
 
 @latency
+@latency
 def node_retrieve(state: AgentState) -> AgentState:
-    query = state.get("refined_question", state["question"])
+    query = state.get("refined_question") or state["question"]
+
     vector_results = db.similarity_search(query, k=12)
     bm25_results = bm25.search(query, k=12)
 
+    def doc_key(d: Document) -> str:
+        src = d.metadata.get("source", "unknown")
+        page = str(d.metadata.get("page", ""))
+        head = d.page_content[:80]
+        return f"{src}|{page}|{head}"
 
-    combined = {id(doc): doc for doc in (vector_results + bm25_results)}
+    combined: dict[str, Document] = {}
+    for d in vector_results + bm25_results:
+        k = doc_key(d)
+        combined[k] = d
+
     merged_docs = list(combined.values())
 
     if not merged_docs:
         return {
             **state,
             "documents": [],
-            "answer": "No documents found."
+            "answer": "No documents found.",
         }
 
     pairs = [(query, d.page_content) for d in merged_docs]
-    scores = reranker.score(pairs)
+
+    try:
+        scores = reranker.score(pairs)
+    except Exception as e:
+        print("[RERANKER] Error while scoring:", e)
+        scores = [0.0] * len(merged_docs)
+
     ranked = sorted(zip(merged_docs, scores), key=lambda x: x[1], reverse=True)
-    top_docs: List[Document] = [d for d, s in ranked[:5]]
+    top_docs: List[Document] = [d for d, _ in ranked[:5]]
+
+    
+    print("\n--- DEBUG RETRIEVED DOCS ---")
+    for d in top_docs:
+        print(f"[DOC] Source={d.metadata.get('source')} Page={d.metadata.get('page')}")
+        print(f"Content Preview: {d.page_content[:200]}")
+        print("--------------------------------------------------")
 
     return {
-        "question": state["question"],
+        **state,                     
         "refined_question": query,
-        "documents": top_docs,
-        "answer": ""
+        "documents": deepcopy(top_docs),
+        "answer": "",                 
     }
+
 
 @latency
 def node_pii_redact(state: AgentState) -> AgentState:
@@ -122,20 +149,38 @@ def node_pii_redact(state: AgentState) -> AgentState:
 
 @latency
 def node_validate(state: AgentState) -> AgentState:
+    """
+    Enterprise-grade validation node for service-related questions.
 
-    if not state["documents"]:
+    This node checks if the retrieved context is relevant to the user's question.
+    Returns 'VALID' if context mentions service, delivery, obligations, or related concepts.
+    Otherwise, it sets the answer to None.
+    """
+
+    docs = state.get("documents", [])
+    if not docs:
+        state["answer"] = None
         return state
 
-    context = "\n\n".join([d.page_content for d in state["documents"]])
+    # Build context from all documents, remove empty pages
+    context = "\n\n".join(d.page_content.strip() for d in docs if getattr(d, "page_content", "").strip())
 
+    # Skip if context is empty
+    if not context:
+        state["answer"] = None
+        return state
+
+    # Enterprise prompt: deterministic single-word output
     prompt = ChatPromptTemplate.from_template("""
-You are a validation agent.
+You are a validation agent for legal/service-related content.
 
-Check if the context contains ANY information that could possibly help answer the question.
-
-Relaxed rules:
-- If context contains ANY related keywords, legal clauses, rights, permissions, obligations, or affiliate/marketing related content → return "VALID".
-- ONLY return "INVALID" if the context is totally unrelated.
+Your task:
+- Only respond with ONE word: VALID or INVALID
+- Do NOT add any explanation or extra text.
+- VALID if ANY part of the context mentions service, delivery, performance,
+  obligations, contractual duties, logistics, vendors, responsibilities,
+  inventory, technology, support, or any similar enterprise/service term.
+- INVALID only if the context is completely unrelated to service or contractual obligations.
 
 Context:
 {context}
@@ -143,25 +188,34 @@ Context:
 Question:
 {question}
 
-Is the answer possible? (VALID / INVALID)
+VALID or INVALID:
 """)
 
-    chain = prompt | llm | StrOutputParser()
-    status = chain.invoke({
+    # Invoke LLM
+    result = (prompt | llm | StrOutputParser()).invoke({
         "context": context,
         "question": state["refined_question"]
     }).strip().upper()
 
-    if "INVALID" in status:
-        return { **state, "answer": None }
+    # Ensure only 'VALID' is accepted, everything else → INVALID
+    if result != "VALID":
+        state["answer"] = None
 
     return state
 
 
+
 @latency
 def node_generate(state: AgentState) -> AgentState:
-    if state.get("answer"):
+    existing_answer = state.get("answer")
+    if isinstance(existing_answer, str) and existing_answer.strip():
         return state
+
+    if not state.get("documents"):
+        return {
+            **state,
+            "answer": "No relevant documents were available to answer this question.",
+        }
 
     context_text = "\n\n".join([d.page_content for d in state["documents"]])
 
